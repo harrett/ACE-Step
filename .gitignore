@@ -202,3 +202,7 @@ pipeline_ace_step_demo.py
 *.wav
 start.sh
 exps/*
+/temp/
+/outputs/
+/data/
+/logs/

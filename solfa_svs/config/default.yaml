@@ -1,0 +1,83 @@
+# SolfaSVS Configuration
+# MIDI-Conditioned Sol-fa Singing Voice Synthesis
+
+# ── Data ──
+data:
+  audio_dir: "data/processed/ace_studio/audio"
+  feature_dir: "data/processed/ace_studio_mel/mel_features"
+  latent_dir: "data/dcae_latents"
+  train_metadata: "data/processed/ace_studio_mel/train_metadata.json"
+  val_metadata: "data/processed/ace_studio_mel/val_metadata.json"
+  source_sr: 44100
+  # DCAE latent frame rate: 44100 / 512 / 8 ≈ 10.77 fps
+  latent_frame_rate: 10.766601562
+  # Mel frame rate: 44100 / 512 ≈ 86.13 fps
+  mel_frame_rate: 86.1328125
+  num_phonemes: 14  # Sol-fa syllables + silence/breath
+
+# ── MIDI Encoder ──
+midi_encoder:
+  embed_dim: 512
+  num_phonemes: 14
+  phoneme_embed_dim: 128
+  pitch_embed_dim: 128
+  max_pitch: 128
+  velocity_embed_dim: 64
+  max_velocity: 128
+  note_transformer_layers: 2
+  note_transformer_heads: 4
+  frame_conv_layers: 3
+  frame_conv_kernel: 3
+  fusion_heads: 4
+
+# ── SolfaDiT ──
+solfa_dit:
+  in_channels: 8
+  out_channels: 8
+  num_layers: 12
+  num_attention_heads: 8
+  attention_head_dim: 64
+  inner_dim: 512  # num_attention_heads * attention_head_dim
+  mlp_ratio: 4.0
+  patch_size: [16, 1]
+  max_height: 16
+  max_width: 4096
+  max_position: 8192
+  rope_theta: 10000.0
+
+# ── Training ──
+training:
+  optimizer: adamw
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  warmup_steps: 1000
+  max_steps: 100000
+  gradient_clip_val: 0.5
+  gradient_checkpointing: true
+  batch_size: 4
+  accumulate_grad_batches: 4
+  precision: "bf16-mixed"
+  num_workers: 4
+  cfg_dropout: 0.15
+  exp_name: "solfa_svs"
+  log_dir: "./exps/solfa_svs/logs"
+  checkpoint_dir: "./exps/solfa_svs/checkpoints"
+  every_n_steps: 5000
+
+# ── Flow Matching ──
+flow_matching:
+  num_train_timesteps: 1000
+  shift: 3.0
+  logit_mean: 0.0
+  logit_std: 1.0
+
+# ── Inference ──
+inference:
+  num_inference_steps: 60
+  guidance_scale: 5.0
+  omega_scale: 10.0
+  sample_rate: 44100
+  cfg_type: "apg"
+  momentum: -0.75
+  norm_threshold: 2.5
