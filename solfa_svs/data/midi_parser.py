@@ -167,7 +167,7 @@ def synthesize_features_from_notes(
     This is the PRODUCTION path — only the score (note events) is needed.
     Each note is split into consonant onset (~30%) and vowel nucleus (~70%).
     F0 is a flat pitch per note (expression added later).
-    Energy is derived from velocity, scaled to match training audio RMS range.
+    Energy is derived from velocity, scaled to match training mel RMS range.
 
     Args:
         notes: List of note event dicts. Each must have:
@@ -180,8 +180,8 @@ def synthesize_features_from_notes(
         frame_rate: target frame rate (DCAE latent rate)
         consonant_ratio: fraction of note for consonant onset (default 0.30)
         energy_scale: scale factor mapping MIDI velocity to training energy range.
-            Training energy is mel RMS (~0.11 mean at 44.1kHz), not raw velocity/127 (~0.4).
-            Default 0.35 calibrated as training_mean / raw_inference_mean = 0.111 / 0.315.
+            Training energy is mel RMS (~0.11 mean at 44.1kHz).
+            Default 0.35 calibrated from the training dataset.
 
     Returns:
         f0: (L,) F0 in Hz at frame rate
@@ -219,10 +219,10 @@ def synthesize_features_from_notes(
         # F0 from MIDI pitch
         f0[onset_frame:offset_frame] = midi_pitch_to_hz(midi_pitch)
 
-        # Energy from velocity, scaled to match training audio RMS range,
+        # Energy from velocity, scaled to match training mel RMS range,
         # with within-note envelope to match training energy dynamics.
-        # Training audio has natural attack/decay variation (std≈0.036);
-        # flat energy (std≈0.013) produces lower-quality output.
+        # Training energy has ACE Studio's internal dynamics (attack/decay);
+        # flat energy produces lower-quality output.
         base_energy = (velocity / 127.0) * energy_scale
         note_frames = offset_frame - onset_frame
         if note_frames > 1:
@@ -248,11 +248,18 @@ def synthesize_features_from_notes(
         if solfa is not None and solfa in SOLFA_SYLLABLES:
             c_id, v_id = solfa_to_phoneme_ids(solfa)
             note_frames = offset_frame - onset_frame
-            consonant_frames = max(1, int(note_frames * consonant_ratio))
-            consonant_end = onset_frame + consonant_frames
-
-            phonemes[onset_frame:consonant_end] = c_id
-            phonemes[consonant_end:offset_frame] = v_id
+            if note_frames <= 1:
+                # Too short for consonant/vowel split — assign vowel only.
+                # At 1 frame (~93ms), max(1, int(1*0.3))=1 would steal the
+                # entire frame for the consonant, leaving no vowel. Vowels
+                # carry the tonal content and dominate in training data even
+                # at fast tempos, so vowel-only is the better approximation.
+                phonemes[onset_frame:offset_frame] = v_id
+            else:
+                consonant_frames = max(1, int(note_frames * consonant_ratio))
+                consonant_end = onset_frame + consonant_frames
+                phonemes[onset_frame:consonant_end] = c_id
+                phonemes[consonant_end:offset_frame] = v_id
 
     # Extract note events from synthesized frame-level features.
     # This matches the training format where extract_note_events() segments

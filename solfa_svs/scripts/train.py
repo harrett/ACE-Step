@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--exp_name", type=str, default="solfa_svs")
     parser.add_argument("--exp_dir", type=str, default="./exps",
                         help="Base directory for all experiments")
-    parser.add_argument("--every_n_steps", type=int, default=5000)
+    parser.add_argument("--every_n_steps", type=int, default=1000)
 
     # Resume
     parser.add_argument("--resume_from", type=str, default=None)
