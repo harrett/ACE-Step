@@ -27,6 +27,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from solfa_svs.models.solfa_dit import SolfaDiT
 from solfa_svs.models.midi_encoder import MidiEncoder
+from solfa_svs.models.speaker_encoder import SpeakerEncoder
 from solfa_svs.data.midi_parser import (
     load_midi_file,
     synthesize_features_from_notes,
@@ -51,6 +52,7 @@ class SolfaSVSPipeline:
     - solfa_dit: Trained diffusion transformer
     - midi_encoder: Trained MIDI conditioning encoder
     - dcae: Frozen ACE-Step DCAE decoder + vocoder
+    - speaker_encoder: Optional frozen speaker encoder for zero-shot voice cloning
     """
 
     def __init__(
@@ -58,12 +60,16 @@ class SolfaSVSPipeline:
         solfa_dit: SolfaDiT,
         midi_encoder: MidiEncoder,
         dcae: MusicDCAE,
+        speaker_encoder: Optional[SpeakerEncoder] = None,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
     ):
         self.solfa_dit = solfa_dit.to(device).eval()
         self.midi_encoder = midi_encoder.to(device).eval()
         self.dcae = dcae.to(device).eval()
+        self.speaker_encoder = speaker_encoder
+        if self.speaker_encoder is not None:
+            self.speaker_encoder = self.speaker_encoder.to(device).eval()
         self.device = device
         self.dtype = dtype
 
@@ -72,6 +78,7 @@ class SolfaSVSPipeline:
         cls,
         checkpoint_path: str,
         dcae_checkpoint_dir: Optional[str] = None,
+        speaker_projection_path: Optional[str] = None,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
     ):
@@ -81,6 +88,9 @@ class SolfaSVSPipeline:
         Args:
             checkpoint_path: Path to PyTorch Lightning checkpoint
             dcae_checkpoint_dir: Path to ACE-Step checkpoint for DCAE
+            speaker_projection_path: Path to speaker_projection.pt saved during
+                preprocessing. Required for speaker-conditioned models to produce
+                correct embeddings at inference time.
             device: Device for inference
             dtype: Dtype for inference
         """
@@ -92,6 +102,32 @@ class SolfaSVSPipeline:
         )
         solfa_dit = trainer_module.solfa_dit.to(dtype)
         midi_encoder = trainer_module.midi_encoder.to(dtype)
+
+        # Check if model has speaker conditioning
+        speaker_encoder = None
+        speaker_dim = trainer_module.hparams.get("speaker_dim", 0)
+        if speaker_dim > 0:
+            # Create speaker encoder with matching output_dim
+            speaker_encoder = SpeakerEncoder(
+                output_dim=speaker_dim,
+                device=device,
+            )
+            # Load the projection weights that were used during preprocessing.
+            # Without these, the 192→speaker_dim projection is random and the
+            # speaker embeddings will be in a different space than training.
+            if speaker_projection_path and os.path.exists(speaker_projection_path):
+                proj_state = torch.load(
+                    speaker_projection_path, map_location="cpu", weights_only=True
+                )
+                speaker_encoder.projection.load_state_dict(proj_state)
+                print(f"Loaded speaker projection from: {speaker_projection_path}")
+            else:
+                import warnings
+                warnings.warn(
+                    "Speaker-conditioned model loaded WITHOUT speaker_projection.pt. "
+                    "Speaker embeddings will use random projection weights and will NOT "
+                    "match training. Pass --speaker_projection_path to fix this."
+                )
 
         # Load DCAE
         if dcae_checkpoint_dir is not None:
@@ -105,7 +141,7 @@ class SolfaSVSPipeline:
         dcae = dcae.to(torch.float32)
         dcae.requires_grad_(False)
 
-        return cls(solfa_dit, midi_encoder, dcae, device, dtype)
+        return cls(solfa_dit, midi_encoder, dcae, speaker_encoder, device, dtype)
 
     @torch.no_grad()
     def generate_from_midi(
@@ -118,6 +154,7 @@ class SolfaSVSPipeline:
         output_sr: int = 44100,
         seed: Optional[int] = None,
         apply_expression: bool = True,
+        reference_audio: Optional[str] = None,
     ) -> tuple:
         """
         Generate audio from a MIDI file (production path).
@@ -135,6 +172,7 @@ class SolfaSVSPipeline:
             output_sr: Output sample rate (default 44100)
             seed: Random seed
             apply_expression: Apply vibrato/portamento to F0
+            reference_audio: Optional path to reference audio for speaker cloning
 
         Returns:
             (sample_rate, waveform) tuple
@@ -170,6 +208,7 @@ class SolfaSVSPipeline:
             omega_scale=omega_scale,
             output_sr=output_sr,
             seed=seed,
+            reference_audio=reference_audio,
         )
 
     @torch.no_grad()
@@ -183,6 +222,7 @@ class SolfaSVSPipeline:
         output_sr: int = 44100,
         seed: Optional[int] = None,
         apply_expression: bool = True,
+        reference_audio: Optional[str] = None,
     ) -> tuple:
         """
         Generate audio from a list of note events (programmatic API).
@@ -201,6 +241,7 @@ class SolfaSVSPipeline:
             output_sr: Output sample rate
             seed: Random seed
             apply_expression: Apply vibrato/portamento
+            reference_audio: Optional path to reference audio for speaker cloning
 
         Returns:
             (sample_rate, waveform) tuple
@@ -227,6 +268,7 @@ class SolfaSVSPipeline:
             omega_scale=omega_scale,
             output_sr=output_sr,
             seed=seed,
+            reference_audio=reference_audio,
         )
 
     @torch.no_grad()
@@ -241,6 +283,7 @@ class SolfaSVSPipeline:
         omega_scale: float = 10.0,
         output_sr: int = 44100,
         seed: Optional[int] = None,
+        reference_audio: Optional[str] = None,
     ) -> tuple:
         """
         Core diffusion loop shared by all generate methods.
@@ -255,6 +298,7 @@ class SolfaSVSPipeline:
             omega_scale: Mean-shift scale for scheduler
             output_sr: Output sample rate
             seed: Random seed
+            reference_audio: Optional path to reference audio for speaker cloning
 
         Returns:
             (sample_rate, waveform) tuple
@@ -302,6 +346,30 @@ class SolfaSVSPipeline:
         )
         encoder_hidden_states = encoder_hidden_states.to(dtype)
 
+        # Extract speaker embedding from reference audio
+        speaker_embeds = None
+        null_speaker_embeds = None
+        has_speaker = (
+            self.speaker_encoder is not None
+            and self.solfa_dit.speaker_embedding_dim > 0
+        )
+        if has_speaker and reference_audio is not None:
+            # Move projection to CPU for compatibility with FunASR output,
+            # then move the result to the target device.
+            self.speaker_encoder.projection = self.speaker_encoder.projection.cpu()
+            speaker_embeds = self.speaker_encoder.encode_from_file(
+                reference_audio
+            ).to(device=device, dtype=dtype)
+            # Move projection back to device for potential future calls
+            self.speaker_encoder.projection = self.speaker_encoder.projection.to(device)
+            null_speaker_embeds = torch.zeros_like(speaker_embeds)
+            print(f"  Speaker embedding: norm={speaker_embeds.float().norm():.4f}")
+        elif has_speaker:
+            # No reference audio: use zero embedding (unconditional)
+            spk_dim = self.solfa_dit.speaker_embedding_dim
+            speaker_embeds = torch.zeros(1, spk_dim, device=device, dtype=dtype)
+            null_speaker_embeds = torch.zeros_like(speaker_embeds)
+
         # Null conditioning for CFG
         null_hidden_states = torch.zeros_like(encoder_hidden_states)
         null_mask = torch.zeros_like(encoder_mask)
@@ -342,11 +410,18 @@ class SolfaSVSPipeline:
                 )
                 enc_mask = torch.cat([encoder_mask, null_mask], dim=0)
                 t_expand = t.expand(2)
+                # For CFG: conditional uses real speaker, unconditional uses zeros
+                spk_for_dit = None
+                if speaker_embeds is not None:
+                    spk_for_dit = torch.cat(
+                        [speaker_embeds, null_speaker_embeds], dim=0
+                    )
             else:
                 latent_input = latent
                 enc_states = encoder_hidden_states
                 enc_mask = encoder_mask
                 t_expand = t.expand(1)
+                spk_for_dit = speaker_embeds
 
             noise_pred = self.solfa_dit(
                 hidden_states=latent_input,
@@ -354,6 +429,7 @@ class SolfaSVSPipeline:
                 encoder_hidden_states=enc_states,
                 encoder_hidden_mask=enc_mask,
                 timestep=t_expand.to(dtype),
+                speaker_embeds=spk_for_dit,
             )
 
             if do_cfg:

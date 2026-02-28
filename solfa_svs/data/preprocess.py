@@ -137,6 +137,8 @@ def preprocess_sample(
     output_path: str,
     device: str = "cpu",
     apply_expression: bool = True,
+    speaker_encoder=None,
+    speaker_id: int = 0,
 ) -> bool:
     """
     Preprocess a single sample: encode audio + resample features + save .pt
@@ -148,6 +150,8 @@ def preprocess_sample(
         output_path: Path to save .pt file
         device: Computation device
         apply_expression: Whether to apply vibrato/portamento to F0
+        speaker_encoder: Optional SpeakerEncoder for extracting speaker embeddings
+        speaker_id: Integer speaker ID for this sample
 
     Returns:
         True if successful
@@ -180,7 +184,12 @@ def preprocess_sample(
                 transition_frames=1,   # ~93ms
             )
 
-        # 4. Save consolidated sample
+        # 4. Extract speaker embedding if encoder provided
+        speaker_embedding = torch.zeros(0)
+        if speaker_encoder is not None:
+            speaker_embedding = speaker_encoder.encode_from_file(audio_path).squeeze(0).cpu()
+
+        # 5. Save consolidated sample
         sample = {
             "latent": latent,                                    # (8, 16, L)
             "latent_length": latent_length,                      # int
@@ -188,6 +197,8 @@ def preprocess_sample(
             "f0": torch.from_numpy(f0).float(),                  # (L,)
             "energy": torch.from_numpy(features["energy"]).float(),  # (L,)
             "phonemes": torch.from_numpy(features["phonemes"]).long(),  # (L,)
+            "speaker_embedding": speaker_embedding,              # (speaker_dim,) or (0,)
+            "speaker_id": speaker_id,                            # int
         }
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -199,6 +210,108 @@ def preprocess_sample(
         return False
 
 
+def augment_with_speaker_embeddings(
+    source_dir: str,
+    output_dir: str,
+    audio_dir: str,
+    speaker_encoder_name: Optional[str] = None,
+    device: str = "cpu",
+):
+    """
+    Fast path: copy existing .pt files and add speaker embeddings.
+
+    Skips DCAE encoding entirely — only loads existing latents,
+    extracts speaker embeddings from the corresponding audio, and
+    re-saves with the new fields.
+
+    Args:
+        source_dir: Directory with existing .pt files + train.json/val.json
+        output_dir: Output directory (must differ from source_dir)
+        audio_dir: Directory containing source WAV files
+        speaker_encoder_name: Optional model name for speaker encoder
+        device: Device for computation
+    """
+    from solfa_svs.models.speaker_encoder import SpeakerEncoder
+
+    if os.path.abspath(source_dir) == os.path.abspath(output_dir):
+        raise ValueError(
+            f"source_dir and output_dir must differ to avoid overwriting. "
+            f"Got: {source_dir}"
+        )
+
+    print("Loading speaker encoder...")
+    kwargs = {"device": device}
+    if speaker_encoder_name:
+        kwargs["model_name"] = speaker_encoder_name
+    speaker_encoder = SpeakerEncoder(**kwargs)
+    speaker_encoder.eval()
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Copy metadata JSONs and process .pt files
+    for json_name in ("train.json", "val.json"):
+        src_json = os.path.join(source_dir, json_name)
+        if not os.path.exists(src_json):
+            print(f"  Warning: {src_json} not found, skipping split")
+            continue
+
+        with open(src_json) as f:
+            metadata = json.load(f)
+
+        print(f"\n=== Augmenting {json_name} ({len(metadata)} samples) ===")
+
+        valid_entries = []
+        for entry in tqdm(metadata, desc=json_name.replace(".json", "")):
+            sample_id = entry["sample_id"]
+            src_pt = os.path.join(source_dir, entry["pt_path"])
+
+            if not os.path.exists(src_pt):
+                print(f"  Skip {sample_id}: {src_pt} not found")
+                continue
+
+            # Find corresponding audio (try speaker-namespaced path first)
+            speaker_name = entry.get("speaker_name", "")
+            if speaker_name:
+                audio_path = os.path.join(audio_dir, speaker_name, "audio", f"{sample_id}.wav")
+            else:
+                audio_path = os.path.join(audio_dir, f"{sample_id}.wav")
+            if not os.path.exists(audio_path):
+                # Fallback: flat directory
+                audio_path = os.path.join(audio_dir, f"{sample_id}.wav")
+            if not os.path.exists(audio_path):
+                print(f"  Skip {sample_id}: audio not found at {audio_path}")
+                continue
+
+            # Load existing .pt
+            sample = torch.load(src_pt, map_location="cpu", weights_only=False)
+
+            # Extract speaker embedding (the only new computation)
+            speaker_embedding = speaker_encoder.encode_from_file(
+                audio_path
+            ).squeeze(0).cpu()
+
+            sample["speaker_embedding"] = speaker_embedding
+            sample["speaker_id"] = entry.get("speaker_id", 0)
+
+            # Save to output_dir
+            dst_pt = os.path.join(output_dir, entry["pt_path"])
+            os.makedirs(os.path.dirname(dst_pt) or output_dir, exist_ok=True)
+            torch.save(sample, dst_pt)
+            valid_entries.append(entry)
+
+        # Write metadata to output_dir
+        dst_json = os.path.join(output_dir, json_name)
+        with open(dst_json, "w") as f:
+            json.dump(valid_entries, f, indent=2)
+
+    # Save speaker encoder projection weights for inference reproducibility
+    proj_path = os.path.join(output_dir, "speaker_projection.pt")
+    torch.save(speaker_encoder.projection.state_dict(), proj_path)
+    print(f"Speaker projection saved: {proj_path}")
+
+    print(f"\nDone! Augmented .pt files saved to: {output_dir}")
+
+
 def run_preprocessing(
     audio_dir: str,
     feature_dir: str,
@@ -208,6 +321,8 @@ def run_preprocessing(
     checkpoint_dir: Optional[str] = None,
     device: str = "cpu",
     validate_n: int = 5,
+    extract_speaker: bool = False,
+    speaker_encoder_name: Optional[str] = None,
 ):
     """
     Run full preprocessing pipeline.
@@ -221,9 +336,22 @@ def run_preprocessing(
         checkpoint_dir: ACE-Step checkpoint directory (None = auto-download)
         device: Computation device
         validate_n: Number of samples for round-trip validation
+        extract_speaker: Whether to extract speaker embeddings
+        speaker_encoder_name: Optional model name for speaker encoder
     """
     print("Loading DCAE model...")
     dcae = load_dcae(checkpoint_dir, device)
+
+    # Load speaker encoder if requested
+    speaker_encoder = None
+    if extract_speaker:
+        from solfa_svs.models.speaker_encoder import SpeakerEncoder
+        print("Loading speaker encoder...")
+        kwargs = {"device": device}
+        if speaker_encoder_name:
+            kwargs["model_name"] = speaker_encoder_name
+        speaker_encoder = SpeakerEncoder(**kwargs)
+        speaker_encoder.eval()
 
     # Load metadata
     with open(train_metadata_path) as f:
@@ -287,17 +415,31 @@ def run_preprocessing(
                 print(f"  Skip {sample_id}: features not found")
                 continue
 
-            output_path = os.path.join(output_dir, f"{sample_id}.pt")
+            # Namespace .pt files by speaker to avoid collisions
+            # when multiple speakers share the same sample IDs
+            speaker_name = sample.get("speaker_name", "")
+            if speaker_name:
+                pt_subpath = os.path.join(speaker_name, f"{sample_id}.pt")
+            else:
+                pt_subpath = f"{sample_id}.pt"
+            output_path = os.path.join(output_dir, pt_subpath)
+
+            # Resolve speaker_id from metadata or directory structure
+            speaker_id = sample.get("speaker_id", 0)
 
             success = preprocess_sample(
                 dcae, audio_path, npz_path, output_path, device,
+                speaker_encoder=speaker_encoder,
+                speaker_id=speaker_id,
             )
 
             if success:
                 split_entries.append({
                     "sample_id": sample_id,
-                    "pt_path": f"{sample_id}.pt",
+                    "pt_path": pt_subpath,
                     "duration": sample.get("duration", 0),
+                    "speaker_id": speaker_id,
+                    "speaker_name": speaker_name,
                 })
 
     # Save new metadata
@@ -308,6 +450,13 @@ def run_preprocessing(
         json.dump(train_entries, f, indent=2)
     with open(val_json_path, "w") as f:
         json.dump(val_entries, f, indent=2)
+
+    # Save speaker encoder projection weights so inference can reproduce
+    # the exact same 192→speaker_dim mapping used for these embeddings.
+    if speaker_encoder is not None:
+        proj_path = os.path.join(output_dir, "speaker_projection.pt")
+        torch.save(speaker_encoder.projection.state_dict(), proj_path)
+        print(f"Speaker projection saved: {proj_path}")
 
     print(f"\nDone! Processed {len(train_entries)} train + {len(val_entries)} val samples")
     print(f"Saved to: {output_dir}")

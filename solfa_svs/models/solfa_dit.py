@@ -55,6 +55,7 @@ class SolfaDiT(ModelMixin, ConfigMixin):
         max_height: int = 16,
         max_width: int = 4096,
         conditioning_dim: int = 512,
+        speaker_embedding_dim: int = 0,
     ):
         super().__init__()
 
@@ -64,6 +65,21 @@ class SolfaDiT(ModelMixin, ConfigMixin):
         self.attention_head_dim = attention_head_dim
         self.out_channels = out_channels
         self.patch_size = patch_size
+        self.speaker_embedding_dim = speaker_embedding_dim
+
+        # Speaker embedding projection
+        # Dual injection: (1) AdaLN path for global timbre modulation,
+        # (2) cross-attention token for fine-grained conditioning.
+        # AdaLN injection is the primary path — it modulates every layer
+        # and cannot be ignored by the model (unlike a single cross-attn token
+        # among thousands of MIDI tokens).
+        if speaker_embedding_dim > 0:
+            self.speaker_embedder = nn.Linear(speaker_embedding_dim, conditioning_dim)
+            self.speaker_adaln = nn.Sequential(
+                nn.Linear(speaker_embedding_dim, inner_dim),
+                nn.SiLU(),
+                nn.Linear(inner_dim, inner_dim),
+            )
 
         # RoPE positional encoding
         self.rotary_emb = Qwen2RotaryEmbedding(
@@ -127,18 +143,46 @@ class SolfaDiT(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,             # (B, L_cond, D_cond)
         encoder_hidden_mask: torch.Tensor,               # (B, L_cond)
         timestep: torch.Tensor,                          # (B,) diffusion timestep
+        speaker_embeds: Optional[torch.Tensor] = None,   # (B, speaker_dim) or None
     ) -> torch.Tensor:
         """
         Forward pass of the diffusion transformer.
 
+        Args:
+            speaker_embeds: Optional speaker embedding. When provided and
+                speaker_embedding_dim > 0, projects to a single token and
+                prepends to encoder_hidden_states (following ACE-Step pattern).
+                When None, behavior is identical to the original model.
+
         Returns: (B, 8, 16, L) predicted clean latent
         """
         output_length = hidden_states.shape[-1]
+        B = hidden_states.shape[0]
+
+        # Prepend speaker token to cross-attention context if available
+        if self.speaker_embedding_dim > 0 and speaker_embeds is not None:
+            # Cross-attention token (fine-grained): (B, speaker_dim) -> (B, 1, conditioning_dim)
+            speaker_token = self.speaker_embedder(speaker_embeds).unsqueeze(1)
+            speaker_mask = torch.ones(B, 1, device=hidden_states.device,
+                                      dtype=encoder_hidden_mask.dtype)
+            encoder_hidden_states = torch.cat(
+                [speaker_token, encoder_hidden_states], dim=1
+            )
+            encoder_hidden_mask = torch.cat(
+                [speaker_mask, encoder_hidden_mask], dim=1
+            )
 
         # Timestep embedding → AdaLN modulation vector
         embedded_timestep = self.timestep_embedder(
             self.time_proj(timestep).to(dtype=hidden_states.dtype)
         )
+
+        # AdaLN injection: add speaker to timestep embedding BEFORE t_block
+        # so every transformer layer is modulated by speaker identity
+        if self.speaker_embedding_dim > 0 and speaker_embeds is not None:
+            speaker_adaln = self.speaker_adaln(speaker_embeds)  # (B, inner_dim)
+            embedded_timestep = embedded_timestep + speaker_adaln
+
         temb = self.t_block(embedded_timestep)  # (B, 6 * inner_dim)
 
         # Patchify: (B, 8, 16, L) → (B, L, inner_dim)

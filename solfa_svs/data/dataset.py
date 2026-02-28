@@ -19,6 +19,8 @@ class SolfaDataset(Dataset):
     - f0: (L,) F0 in Hz at latent frame rate
     - energy: (L,) energy at latent frame rate
     - phonemes: (L,) phoneme IDs at latent frame rate
+    - speaker_embedding: (speaker_dim,) optional speaker embedding
+    - speaker_id: int optional speaker ID
     """
 
     def __init__(
@@ -26,18 +28,21 @@ class SolfaDataset(Dataset):
         metadata_path: str,
         latent_dir: str,
         max_length: Optional[int] = None,
+        speaker_dim: int = 0,
     ):
         """
         Args:
             metadata_path: Path to JSON file with list of sample entries
             latent_dir: Directory containing .pt files
             max_length: Maximum latent sequence length (crops longer sequences)
+            speaker_dim: Speaker embedding dimension (0 = no speaker conditioning)
         """
         with open(metadata_path) as f:
             self.metadata = json.load(f)
 
         self.latent_dir = latent_dir
         self.max_length = max_length
+        self.speaker_dim = speaker_dim
 
         # Filter out missing files
         valid = []
@@ -96,6 +101,11 @@ class SolfaDataset(Dataset):
             "energy": energy,
             "phonemes": phonemes,
             "L": L,
+            "speaker_embedding": sample.get(
+                "speaker_embedding",
+                torch.zeros(self.speaker_dim) if self.speaker_dim > 0 else torch.zeros(0),
+            ),
+            "speaker_id": sample.get("speaker_id", 0),
         }
 
 
@@ -167,4 +177,10 @@ def collate_fn(batch: List[Dict]) -> Dict:
         "note_durations": note_durations,
         "note_positions": note_positions,
         "note_mask": note_mask,
+        "speaker_embedding": torch.stack(
+            [item["speaker_embedding"] for item in batch], dim=0
+        ),
+        "speaker_id": torch.tensor(
+            [item["speaker_id"] for item in batch], dtype=torch.long
+        ),
     }

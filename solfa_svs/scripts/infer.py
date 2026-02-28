@@ -48,6 +48,8 @@ def generate_one(pipeline, midi_path, metadata_path, output_path, args):
     print(f"Generating from MIDI: {midi_path}")
     if metadata_path:
         print(f"  Metadata: {metadata_path}")
+    if args.reference_audio:
+        print(f"  Reference audio: {args.reference_audio}")
 
     sr, wav = pipeline.generate_from_midi(
         midi_path=midi_path,
@@ -58,7 +60,25 @@ def generate_one(pipeline, midi_path, metadata_path, output_path, args):
         output_sr=args.output_sr,
         seed=args.seed,
         apply_expression=not args.no_expression,
+        reference_audio=args.reference_audio,
     )
+
+    # Apply post-generation voice conversion if VC model provided
+    if args.vc_model_path:
+        print(f"  Applying voice conversion ({args.vc_backend})...")
+        from solfa_svs.voice_conversion.vc_wrapper import VoiceConverter
+        vc = VoiceConverter(
+            model_path=args.vc_model_path,
+            backend=args.vc_backend,
+            index_path=args.vc_index_path,
+            device=args.device,
+        )
+        sr, wav_np = vc.convert(
+            input_audio=wav.numpy(),
+            input_sr=sr,
+            output_sr=sr,
+        )
+        wav = torch.from_numpy(wav_np).float()
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     torchaudio.save(
@@ -115,6 +135,22 @@ def main():
     parser.add_argument("--no_expression", action="store_true",
                         help="Disable vibrato/portamento")
 
+    # Speaker conditioning (Phase 2)
+    parser.add_argument("--reference_audio", type=str, default=None,
+                        help="Path to reference audio for zero-shot speaker cloning")
+    parser.add_argument("--speaker_projection_path", type=str, default=None,
+                        help="Path to speaker_projection.pt from preprocessing "
+                             "(required for correct speaker embeddings)")
+
+    # Voice conversion (Phase 1)
+    parser.add_argument("--vc_model_path", type=str, default=None,
+                        help="Path to VC model for post-generation timbre conversion")
+    parser.add_argument("--vc_backend", type=str, default="rvc",
+                        choices=["rvc", "sovits"],
+                        help="Voice conversion backend (default: rvc)")
+    parser.add_argument("--vc_index_path", type=str, default=None,
+                        help="Path to RVC .index file for retrieval")
+
     # Device
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16")
@@ -127,6 +163,7 @@ def main():
     pipeline = SolfaSVSPipeline.from_pretrained(
         checkpoint_path=args.checkpoint_path,
         dcae_checkpoint_dir=args.dcae_checkpoint_dir,
+        speaker_projection_path=args.speaker_projection_path,
         device=args.device,
         dtype=dtype,
     )

@@ -31,6 +31,7 @@ class SolfaSVSTrainer(LightningModule):
     - Flow-matching noise schedule with shift
     - Preconditioning on model predictions
     - Classifier-free guidance dropout
+    - Optional speaker conditioning with separate CFG dropout rate
     """
 
     def __init__(
@@ -47,6 +48,10 @@ class SolfaSVSTrainer(LightningModule):
         gradient_clip_val: float = 0.5,
         gradient_checkpointing: bool = True,
         cfg_dropout: float = 0.15,
+        # Speaker config
+        speaker_dim: int = 0,
+        speaker_cfg_dropout: float = 0.5,
+        speaker_warmup: bool = False,
         # Flow matching config
         num_train_timesteps: int = 1000,
         shift: float = 3.0,
@@ -68,6 +73,10 @@ class SolfaSVSTrainer(LightningModule):
             solfa_dit_config = {}
         if midi_encoder_config is None:
             midi_encoder_config = {}
+
+        # Inject speaker_embedding_dim into SolfaDiT config
+        if speaker_dim > 0:
+            solfa_dit_config["speaker_embedding_dim"] = speaker_dim
 
         # Build models
         self.solfa_dit = SolfaDiT(**solfa_dit_config)
@@ -132,7 +141,7 @@ class SolfaSVSTrainer(LightningModule):
             attention_mask=attention_mask,
         )  # (B, L, 512), (B, L)
 
-        # 2. CFG dropout: zero out conditioning with probability
+        # 2. CFG dropout: zero out MIDI conditioning with probability
         if self.training and self.hparams.cfg_dropout > 0:
             cfg_mask = (
                 torch.rand(B, device=device) < self.hparams.cfg_dropout
@@ -142,6 +151,17 @@ class SolfaSVSTrainer(LightningModule):
                 1.0 - cfg_mask[:, None, None]
             )
             encoder_mask = encoder_mask * (1.0 - cfg_mask[:, None])
+
+        # 2b. Speaker embedding with separate CFG dropout
+        speaker_embeds = None
+        if self.hparams.speaker_dim > 0:
+            speaker_embeds = batch["speaker_embedding"].to(device=device, dtype=dtype)
+            # Speaker CFG dropout: zero out speaker embedding independently
+            if self.training and self.hparams.speaker_cfg_dropout > 0:
+                spk_cfg_mask = (
+                    torch.rand(B, device=device) < self.hparams.speaker_cfg_dropout
+                ).float()
+                speaker_embeds = speaker_embeds * (1.0 - spk_cfg_mask[:, None])
 
         # 3. Sample timesteps (logit-normal)
         timesteps = self.sample_timesteps(B, device)
@@ -158,6 +178,7 @@ class SolfaSVSTrainer(LightningModule):
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_mask=encoder_mask,
             timestep=timesteps.to(dtype),
+            speaker_embeds=speaker_embeds,
         )
 
         # 6. Preconditioning (Section 5 of https://arxiv.org/abs/2206.00364)
@@ -210,6 +231,11 @@ class SolfaSVSTrainer(LightningModule):
             attention_mask=attention_mask,
         )
 
+        # Speaker embedding (no dropout during validation)
+        speaker_embeds = None
+        if self.hparams.speaker_dim > 0:
+            speaker_embeds = batch["speaker_embedding"].to(device=device, dtype=dtype)
+
         timesteps = self.sample_timesteps(B, device)
         sigmas = self.get_sigmas(timesteps, n_dim=target_latent.ndim)
         noise = torch.randn_like(target_latent)
@@ -221,6 +247,7 @@ class SolfaSVSTrainer(LightningModule):
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_mask=encoder_mask,
             timestep=timesteps.to(dtype),
+            speaker_embeds=speaker_embeds,
         )
 
         model_pred = model_pred * (-sigmas) + noisy_latent
@@ -274,15 +301,18 @@ class SolfaSVSTrainer(LightningModule):
             metadata_path=self.hparams.train_metadata,
             latent_dir=self.hparams.latent_dir,
             max_length=self.hparams.max_seq_length,
+            speaker_dim=self.hparams.speaker_dim,
         )
+        nw = self.hparams.num_workers
         return DataLoader(
             dataset,
             batch_size=self.hparams.batch_size,
             shuffle=True,
-            num_workers=self.hparams.num_workers,
+            num_workers=nw,
             collate_fn=collate_fn,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=nw > 0,
         )
 
     def val_dataloader(self):
@@ -290,12 +320,15 @@ class SolfaSVSTrainer(LightningModule):
             metadata_path=self.hparams.val_metadata,
             latent_dir=self.hparams.latent_dir,
             max_length=self.hparams.max_seq_length,
+            speaker_dim=self.hparams.speaker_dim,
         )
+        nw = self.hparams.num_workers
         return DataLoader(
             dataset,
             batch_size=self.hparams.batch_size,
             shuffle=False,
-            num_workers=self.hparams.num_workers,
+            num_workers=nw,
             collate_fn=collate_fn,
             pin_memory=True,
+            persistent_workers=nw > 0,
         )

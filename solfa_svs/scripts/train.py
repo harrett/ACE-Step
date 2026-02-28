@@ -27,6 +27,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from solfa_svs.training.trainer import SolfaSVSTrainer
 
 torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
 
 
 def main():
@@ -50,11 +51,21 @@ def main():
     parser.add_argument("--cfg_dropout", type=float, default=0.15)
     parser.add_argument("--precision", type=str, default="bf16-mixed")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the model for faster training")
 
     # Flow matching
     parser.add_argument("--shift", type=float, default=3.0)
     parser.add_argument("--logit_mean", type=float, default=0.0)
     parser.add_argument("--logit_std", type=float, default=1.0)
+
+    # Speaker conditioning
+    parser.add_argument("--speaker_dim", type=int, default=0,
+                        help="Speaker embedding dimension (0 = disabled)")
+    parser.add_argument("--speaker_cfg_dropout", type=float, default=0.5,
+                        help="CFG dropout rate for speaker embedding")
+    parser.add_argument("--speaker_warmup", action="store_true",
+                        help="Freeze base model, train only speaker layers initially")
 
     # Logging
     parser.add_argument("--exp_name", type=str, default="solfa_svs")
@@ -80,6 +91,7 @@ def main():
         "max_width": 4096,
         "max_position": 8192,
         "conditioning_dim": 512,
+        "speaker_embedding_dim": args.speaker_dim,
     }
 
     midi_encoder_config = {
@@ -107,6 +119,9 @@ def main():
         max_steps=args.max_steps,
         gradient_checkpointing=args.gradient_checkpointing,
         cfg_dropout=args.cfg_dropout,
+        speaker_dim=args.speaker_dim,
+        speaker_cfg_dropout=args.speaker_cfg_dropout,
+        speaker_warmup=args.speaker_warmup,
         shift=args.shift,
         logit_mean=args.logit_mean,
         logit_std=args.logit_std,
@@ -123,6 +138,12 @@ def main():
         save_dir=args.exp_dir,
         name=args.exp_name,
     )
+
+    # torch.compile for faster GPU execution
+    if args.compile:
+        print("Compiling model with torch.compile (this may take a few minutes on first step)...")
+        model.solfa_dit = torch.compile(model.solfa_dit, dynamic=True)
+        model.midi_encoder = torch.compile(model.midi_encoder, dynamic=True)
 
     # Callbacks — dirpath=None lets Lightning place checkpoints inside
     # the logger's version directory: {exp_dir}/{exp_name}/version_X/checkpoints/
@@ -159,8 +180,27 @@ def main():
     print(f"Experiment dir: {logger.log_dir}")
     print(f"Checkpoints:    {logger.log_dir}/checkpoints/")
 
-    # Train
-    trainer.fit(model, ckpt_path=args.resume_from)
+    # Train — handle warm-start when resuming from a checkpoint that lacks
+    # new layers (e.g., single-speaker checkpoint → speaker-conditioned model).
+    resume_path = args.resume_from
+    if resume_path:
+        ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        ckpt_state = ckpt.get("state_dict", ckpt)
+        model_keys = set(model.state_dict().keys())
+        ckpt_keys = set(ckpt_state.keys())
+        missing = model_keys - ckpt_keys
+
+        if missing:
+            # Warm start: load existing weights, randomly init new layers,
+            # and start training from step 0 (fresh optimizer/scheduler).
+            print(f"Warm start: {len(missing)} new parameter(s) not in checkpoint "
+                  f"(will be randomly initialized):")
+            for k in sorted(missing):
+                print(f"  + {k}")
+            model.load_state_dict(ckpt_state, strict=False)
+            resume_path = None  # Don't pass to trainer.fit
+
+    trainer.fit(model, ckpt_path=resume_path)
 
 
 if __name__ == "__main__":
