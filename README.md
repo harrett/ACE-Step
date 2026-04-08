@@ -6,7 +6,8 @@
     <a href="https://modelscope.cn/models/ACE-Step/ACE-Step-v1-3.5B">ModelScope</a> |
     <a href="https://huggingface.co/spaces/ACE-Step/ACE-Step">Space Demo</a> |
     <a href="https://discord.gg/PeWDxrkdj7">Discord</a> |
-    <a href="https://arxiv.org/abs/2506.00045">Technical Report</a>
+    <a href="https://arxiv.org/abs/2506.00045">Technical Report</a> |
+    <a href="https://ace-step.github.io/ace-step-v1.5.github.io/">ACE-Step v1.5</a>
 </p>
 
 <p align="center">
@@ -31,6 +32,8 @@ Rather than building yet another end-to-end text-to-music pipeline, our vision i
 
 
 ## 📢 News and Updates
+
+- 🎉 **2026.01.28:** Released [ACE-Step v1.5](https://ace-step.github.io/ace-step-v1.5.github.io/) - Our latest and most advanced model is now available!
 
 - 📃 2025.06.02: Released [ACE-Step Technical Report (PDF)](https://arxiv.org/abs/2506.00045).
 
