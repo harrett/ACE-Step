@@ -553,33 +553,29 @@ def process_speaker(
 
     # Find all MP3 files with matching MIDI
     mp3_files = sorted(audio_dir.glob('*.mp3'))
-    if not mp3_files:
-        print(f"  WARNING: No MP3 files found in {audio_dir}")
-        return []
 
-    print(f"  Found {len(mp3_files)} MP3 files")
+    if mp3_files:
+        print(f"  Found {len(mp3_files)} MP3 files")
 
-    # Filter to those with matching MIDI
-    valid_pairs = []
-    for mp3_path in mp3_files:
-        track_id = mp3_path.stem
-        midi_path = midi_dir / f"{track_id}.mid"
-        meta_path = midi_dir / f"{track_id}.json"
+        # Filter to those with matching MIDI
+        valid_pairs = []
+        for mp3_path in mp3_files:
+            track_id = mp3_path.stem
+            midi_path = midi_dir / f"{track_id}.mid"
+            meta_path = midi_dir / f"{track_id}.json"
 
-        if midi_path.exists():
-            valid_pairs.append((mp3_path, midi_path, meta_path))
+            if midi_path.exists():
+                valid_pairs.append((mp3_path, midi_path, meta_path))
 
-    if max_samples and len(valid_pairs) > max_samples:
-        print(f"  Limiting to {max_samples} samples (from {len(valid_pairs)})")
-        valid_pairs = valid_pairs[:max_samples]
+        if max_samples and len(valid_pairs) > max_samples:
+            print(f"  Limiting to {max_samples} samples (from {len(valid_pairs)})")
+            valid_pairs = valid_pairs[:max_samples]
 
-    print(f"  {len(valid_pairs)} audio-MIDI pairs")
+        print(f"  {len(valid_pairs)} audio-MIDI pairs")
+    else:
+        valid_pairs = []
 
-    if not valid_pairs:
-        print(f"  WARNING: No valid audio-MIDI pairs for {speaker_name}")
-        return []
-
-    # Process files (with incremental skip)
+    # Process new files (with incremental skip)
     metadata_list = []
     skipped_existing = 0
     skipped_failed = 0
@@ -591,7 +587,6 @@ def process_speaker(
         wav_out = speaker_output_dir / 'audio' / f"{track_id}.wav"
         npz_out = speaker_output_dir / 'mel_features' / f"{track_id}.npz"
         if wav_out.exists() and npz_out.exists():
-            # Reload metadata from the existing NPZ to reconstruct metadata entry
             skipped_existing += 1
             continue
 
@@ -611,59 +606,62 @@ def process_speaker(
         else:
             skipped_failed += 1
 
-    # Also collect metadata for previously processed (skipped) tracks
-    # by scanning existing output files
-    if skipped_existing > 0:
-        print(f"  Skipped {skipped_existing} already-processed tracks, rescanning metadata...")
-        existing_npzs = sorted((speaker_output_dir / 'mel_features').glob('*.npz'))
-        existing_ids = {p.stem for p in existing_npzs}
-        newly_processed_ids = {m['sample_id'] for m in metadata_list}
+    # Reconstruct metadata from ALL existing processed output files.
+    # This handles two cases:
+    # 1. Tracks skipped in the loop above (source MP3 exists but already processed)
+    # 2. Tracks whose source MP3s have been deleted after processing
+    existing_npzs = sorted((speaker_output_dir / 'mel_features').glob('*.npz'))
+    newly_processed_ids = {m['sample_id'] for m in metadata_list}
+    recovered_count = 0
 
-        for npz_path in existing_npzs:
-            track_id = npz_path.stem
-            if track_id in newly_processed_ids:
-                continue  # Already in metadata_list from this run
-            wav_path = speaker_output_dir / 'audio' / f"{track_id}.wav"
-            if not wav_path.exists():
-                continue
+    for npz_path in existing_npzs:
+        track_id = npz_path.stem
+        if track_id in newly_processed_ids:
+            continue  # Already in metadata_list from this run
+        wav_path = speaker_output_dir / 'audio' / f"{track_id}.wav"
+        if not wav_path.exists():
+            continue
 
-            # Reconstruct metadata from saved files
-            try:
-                data = np.load(npz_path)
-                f0 = data['f0']
-                phonemes = data['phonemes']
-                num_frames = len(f0)
+        # Reconstruct metadata from saved files
+        try:
+            data = np.load(npz_path)
+            f0 = data['f0']
+            phonemes = data['phonemes']
+            num_frames = len(f0)
 
-                audio_info = sf.info(str(wav_path))
-                duration = audio_info.duration
+            audio_info = sf.info(str(wav_path))
+            duration = audio_info.duration
 
-                unique_phonemes, counts = np.unique(phonemes, return_counts=True)
-                phoneme_stats = {int(p): int(c) for p, c in zip(unique_phonemes, counts)}
-                voiced_ratio = 1.0 - (phoneme_stats.get(1, 0) / num_frames) if num_frames > 0 else 0.0
+            unique_phonemes, counts = np.unique(phonemes, return_counts=True)
+            phoneme_stats = {int(p): int(c) for p, c in zip(unique_phonemes, counts)}
+            voiced_ratio = 1.0 - (phoneme_stats.get(1, 0) / num_frames) if num_frames > 0 else 0.0
 
-                # Count notes from f0 (transitions from 0 to voiced)
-                f0_bool = f0 > 0
-                num_notes = int(np.sum(np.diff(f0_bool.astype(int)) == 1))
+            # Count notes from f0 (transitions from 0 to voiced)
+            f0_bool = f0 > 0
+            num_notes = int(np.sum(np.diff(f0_bool.astype(int)) == 1))
 
-                metadata_list.append({
-                    'sample_id': track_id,
-                    'audio_path': f'{speaker_name}/audio/{track_id}.wav',
-                    'feature_path': f'{speaker_name}/mel_features/{track_id}.npz',
-                    'duration': duration,
-                    'num_frames': num_frames,
-                    'num_notes': num_notes,
-                    'voiced_ratio': voiced_ratio,
-                    'speaker_id': speaker_id,
-                    'speaker_name': speaker_name,
-                    'ppqn': 480,  # Default; exact value not critical for downstream
-                    'tempo_bpm': 120.0,
-                    'time_signature': '4/4',
-                    'truncated': False,
-                })
-            except Exception as e:
-                print(f"  WARNING: Could not reconstruct metadata for {track_id}: {e}")
+            metadata_list.append({
+                'sample_id': track_id,
+                'audio_path': f'{speaker_name}/audio/{track_id}.wav',
+                'feature_path': f'{speaker_name}/mel_features/{track_id}.npz',
+                'duration': duration,
+                'num_frames': num_frames,
+                'num_notes': num_notes,
+                'voiced_ratio': voiced_ratio,
+                'speaker_id': speaker_id,
+                'speaker_name': speaker_name,
+                'ppqn': 480,  # Default; exact value not critical for downstream
+                'tempo_bpm': 120.0,
+                'time_signature': '4/4',
+                'truncated': False,
+            })
+            recovered_count += 1
+        except Exception as e:
+            print(f"  WARNING: Could not reconstruct metadata for {track_id}: {e}")
 
-    print(f"  Processed: {len(metadata_list)} total ({skipped_existing} existing, {skipped_failed} failed)")
+    source_status = f"{len(mp3_files)} source MP3s" if mp3_files else "no source MP3s (recovered from processed output)"
+    print(f"  Result: {len(metadata_list)} total ({source_status}, "
+          f"{skipped_existing} skipped, {recovered_count} recovered, {skipped_failed} failed)")
     return metadata_list
 
 

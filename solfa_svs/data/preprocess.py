@@ -323,9 +323,13 @@ def run_preprocessing(
     validate_n: int = 5,
     extract_speaker: bool = False,
     speaker_encoder_name: Optional[str] = None,
+    speaker_projection_path: Optional[str] = None,
 ):
     """
     Run full preprocessing pipeline.
+
+    Supports incremental processing: existing .pt files are skipped
+    but still included in the output metadata.
 
     Args:
         audio_dir: Directory containing WAV files
@@ -338,12 +342,17 @@ def run_preprocessing(
         validate_n: Number of samples for round-trip validation
         extract_speaker: Whether to extract speaker embeddings
         speaker_encoder_name: Optional model name for speaker encoder
+        speaker_projection_path: Path to existing speaker_projection.pt.
+            When provided, loads these projection weights instead of using
+            random initialization. REQUIRED when adding new speakers to
+            an existing dataset to keep embeddings in the same space.
     """
     print("Loading DCAE model...")
     dcae = load_dcae(checkpoint_dir, device)
 
     # Load speaker encoder if requested
     speaker_encoder = None
+    projection_was_loaded = False
     if extract_speaker:
         from solfa_svs.models.speaker_encoder import SpeakerEncoder
         print("Loading speaker encoder...")
@@ -351,6 +360,19 @@ def run_preprocessing(
         if speaker_encoder_name:
             kwargs["model_name"] = speaker_encoder_name
         speaker_encoder = SpeakerEncoder(**kwargs)
+
+        # Load existing projection weights to keep embeddings in the same space
+        if speaker_projection_path and os.path.exists(speaker_projection_path):
+            proj_state = torch.load(
+                speaker_projection_path, map_location="cpu", weights_only=True
+            )
+            speaker_encoder.projection.load_state_dict(proj_state)
+            projection_was_loaded = True
+            print(f"Loaded existing speaker projection from: {speaker_projection_path}")
+        elif speaker_projection_path:
+            print(f"WARNING: speaker_projection_path '{speaker_projection_path}' not found, "
+                  f"using random projection weights")
+
         speaker_encoder.eval()
 
     # Load metadata
@@ -386,6 +408,8 @@ def run_preprocessing(
 
     train_entries = []
     val_entries = []
+    skipped_existing = 0
+    processed_new = 0
 
     for split_name, split_meta, split_entries in [
         ("train", train_meta, train_entries),
@@ -395,6 +419,28 @@ def run_preprocessing(
 
         for sample in tqdm(split_meta, desc=split_name):
             sample_id = sample["sample_id"]
+            speaker_name = sample.get("speaker_name", "")
+            speaker_id = sample.get("speaker_id", 0)
+
+            # Namespace .pt files by speaker to avoid collisions
+            # when multiple speakers share the same sample IDs
+            if speaker_name:
+                pt_subpath = os.path.join(speaker_name, f"{sample_id}.pt")
+            else:
+                pt_subpath = f"{sample_id}.pt"
+            output_path = os.path.join(output_dir, pt_subpath)
+
+            # Incremental: skip if .pt already exists
+            if os.path.exists(output_path):
+                skipped_existing += 1
+                split_entries.append({
+                    "sample_id": sample_id,
+                    "pt_path": pt_subpath,
+                    "duration": sample.get("duration", 0),
+                    "speaker_id": speaker_id,
+                    "speaker_name": speaker_name,
+                })
+                continue
 
             # Resolve audio path
             audio_path = os.path.join(audio_dir, f"{sample_id}.wav")
@@ -415,18 +461,6 @@ def run_preprocessing(
                 print(f"  Skip {sample_id}: features not found")
                 continue
 
-            # Namespace .pt files by speaker to avoid collisions
-            # when multiple speakers share the same sample IDs
-            speaker_name = sample.get("speaker_name", "")
-            if speaker_name:
-                pt_subpath = os.path.join(speaker_name, f"{sample_id}.pt")
-            else:
-                pt_subpath = f"{sample_id}.pt"
-            output_path = os.path.join(output_dir, pt_subpath)
-
-            # Resolve speaker_id from metadata or directory structure
-            speaker_id = sample.get("speaker_id", 0)
-
             success = preprocess_sample(
                 dcae, audio_path, npz_path, output_path, device,
                 speaker_encoder=speaker_encoder,
@@ -434,6 +468,7 @@ def run_preprocessing(
             )
 
             if success:
+                processed_new += 1
                 split_entries.append({
                     "sample_id": sample_id,
                     "pt_path": pt_subpath,
@@ -441,6 +476,9 @@ def run_preprocessing(
                     "speaker_id": speaker_id,
                     "speaker_name": speaker_name,
                 })
+
+    print(f"\nIncremental summary: {skipped_existing} existing skipped, "
+          f"{processed_new} newly processed")
 
     # Save new metadata
     train_json_path = os.path.join(output_dir, "train.json")
@@ -455,8 +493,13 @@ def run_preprocessing(
     # the exact same 192→speaker_dim mapping used for these embeddings.
     if speaker_encoder is not None:
         proj_path = os.path.join(output_dir, "speaker_projection.pt")
-        torch.save(speaker_encoder.projection.state_dict(), proj_path)
-        print(f"Speaker projection saved: {proj_path}")
+        if projection_was_loaded:
+            # Copy the loaded projection to output_dir (preserve existing weights)
+            torch.save(speaker_encoder.projection.state_dict(), proj_path)
+            print(f"Speaker projection copied to: {proj_path}")
+        else:
+            torch.save(speaker_encoder.projection.state_dict(), proj_path)
+            print(f"Speaker projection saved (NEW random): {proj_path}")
 
-    print(f"\nDone! Processed {len(train_entries)} train + {len(val_entries)} val samples")
+    print(f"\nDone! {len(train_entries)} train + {len(val_entries)} val samples in metadata")
     print(f"Saved to: {output_dir}")

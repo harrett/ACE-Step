@@ -92,6 +92,14 @@ def main():
              "speaker embeddings. Skips DCAE encoding entirely. "
              "Example: --augment_from data/dcae_latents",
     )
+    parser.add_argument(
+        "--speaker_projection_path",
+        type=str,
+        default=None,
+        help="Path to existing speaker_projection.pt. REQUIRED when adding "
+             "new speakers to an existing dataset to keep embeddings in the "
+             "same space. Example: data/dcae_latents_spk/speaker_projection.pt",
+    )
 
     args = parser.parse_args()
 
@@ -128,6 +136,7 @@ def main():
         validate_n=args.validate_n,
         extract_speaker=args.extract_speaker,
         speaker_encoder_name=args.speaker_encoder_name,
+        speaker_projection_path=args.speaker_projection_path,
     )
 
 

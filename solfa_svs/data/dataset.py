@@ -4,10 +4,14 @@ Training Dataset: Loads pre-encoded DCAE latent files for diffusion training.
 
 import os
 import json
+import random
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional
+
+# DCAE latent frame rate
+_FRAME_RATE = 44100 / 512 / 8  # ≈ 10.77 fps
 
 
 class SolfaDataset(Dataset):
@@ -34,7 +38,9 @@ class SolfaDataset(Dataset):
         Args:
             metadata_path: Path to JSON file with list of sample entries
             latent_dir: Directory containing .pt files
-            max_length: Maximum latent sequence length (crops longer sequences)
+            max_length: Maximum latent sequence length. Sequences longer than
+                this are randomly cropped (not front-truncated), so the model
+                sees different parts of long songs across epochs.
             speaker_dim: Speaker embedding dimension (0 = no speaker conditioning)
         """
         with open(metadata_path) as f:
@@ -75,23 +81,40 @@ class SolfaDataset(Dataset):
         energy = energy[:L]
         phonemes = phonemes[:L]
 
-        # Crop if too long
+        # Random crop if too long (not front-truncation)
         if self.max_length is not None and L > self.max_length:
-            latent = latent[:, :, :self.max_length]
-            latent_length = min(latent_length, self.max_length)
-            f0 = f0[:self.max_length]
-            energy = energy[:self.max_length]
-            phonemes = phonemes[:self.max_length]
+            # Pick a random start position so the model sees different
+            # parts of long songs across training epochs.
+            max_start = L - self.max_length
+            start = random.randint(0, max_start)
+            end = start + self.max_length
+
+            latent = latent[:, :, start:end]
+            latent_length = min(latent_length - start, self.max_length)
+            f0 = f0[start:end]
+            energy = energy[start:end]
+            phonemes = phonemes[start:end]
             L = self.max_length
 
-            # Filter notes to fit within cropped length
-            frame_rate = 44100 / 512 / 8
-            max_sec = L / frame_rate
-            notes = [n for n in notes if n["onset_sec"] < max_sec]
+            # Recompute time offset for the crop window
+            start_sec = start / _FRAME_RATE
+            end_sec = end / _FRAME_RATE
+
+            # Filter and re-offset notes to the crop window
+            cropped_notes = []
             for n in notes:
-                n["offset_sec"] = min(n["offset_sec"], max_sec)
-                n["offset_frame"] = min(n["offset_frame"], L)
-                n["duration_sec"] = n["offset_sec"] - n["onset_sec"]
+                n_onset = n["onset_sec"]
+                n_offset = n["offset_sec"]
+                # Keep notes that overlap with the crop window
+                if n_offset > start_sec and n_onset < end_sec:
+                    new_note = dict(n)
+                    new_note["onset_sec"] = max(0.0, n_onset - start_sec)
+                    new_note["offset_sec"] = min(end_sec - start_sec, n_offset - start_sec)
+                    new_note["duration_sec"] = new_note["offset_sec"] - new_note["onset_sec"]
+                    new_note["onset_frame"] = int(new_note["onset_sec"] * _FRAME_RATE)
+                    new_note["offset_frame"] = min(L, int(new_note["offset_sec"] * _FRAME_RATE))
+                    cropped_notes.append(new_note)
+            notes = cropped_notes
 
         return {
             "latent": latent,
